@@ -6,7 +6,7 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
-from mod.adapter_base import GStreamerAdapter
+from adapter_base import GStreamerAdapter
 
 Gst.init(None)
 
@@ -152,6 +152,16 @@ class RTSPadapter(GStreamerAdapter):
             self.logger.error(f"Не удалось создать {depay_name} или {parser_name}")
             return False
         
+        if self.extra_props:
+            for k, v in self.extra_props.items():
+                if k.startswith("depay_"):
+                    self.depay.set_property(k[6:], v)
+
+        if self.extra_props:
+            for k, v in self.extra_props.items():
+                if k.startswith("parser_"):
+                    self.parser.set_property(k[7:], v)
+        
         return True
 
 
@@ -180,6 +190,11 @@ class RTSPadapter(GStreamerAdapter):
             self.logger.error(f"Не удалось создать декодер: {decoder_name}")
             return False
         
+        if self.extra_props:
+            for k, v in self.extra_props.items():
+                if k.startswith("decoder_"):
+                    self.decoder_element.set_property(k[8:], v)
+
         self.logger.info(f"Создан декодер: {decoder_name}")
         return True
 
@@ -252,27 +267,59 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     adapter = RTSPadapter(
-        source_path="rtsp://10.153.240.130:8080/h264.sdp", 
-        width=1920, 
-        height=1080, 
+        source_path="rtsp://10.199.182.187:8080/h264.sdp", 
+        width=720, 
+        height=480, 
         fps=30, 
         decoder="cpu",
-        extra_props={"rtspsrc_protocols": 4}
+        extra_props={"rtspsrc_protocols": 4,
+                     "rtspsrc_latency": 0,
+                     "rtspsrc_drop-on-latency": True,
+                     "rtspsrc_buffer-mode": 0,
+                     "depay_request-keyframe": True,
+                     }
     )
 
     adapter.start()
+
+    disconnect_start_time = None
+    reconnect_cooldown = 5.0  # Пытаться переподключаться каждые 5 секунд
 
     try:
         while True:
             frame = adapter.get_image()
 
-            if frame is not None:
-                cv2.imshow("GStreamer RTSP Test", frame)
+            if adapter.is_frame_fresh:
+                # Поток живой — сбрасываем таймер отвала
+                disconnect_start_time = None
                 
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+                # логика обработки кадра
+                cv2.putText(frame, "ONLINE", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
-                time.sleep(0.001)
+                # Кадр "протух" (нет связи больше 1 секунды)
+                if disconnect_start_time is None:
+                    disconnect_start_time = time.time()
+                
+                time_disconnected = time.time() - disconnect_start_time
+                
+                # Если связь отсутствует дольше лимита (5 секунд) — делаем рестарт
+                if time_disconnected > reconnect_cooldown:
+                    print("Связь потеряна окончательно. Переподключаемся...")
+                    adapter.restart()
+                    disconnect_start_time = time.time() # Сбрасываем таймер, чтобы дать пайплайну время завестись
+                
+                cv2.putText(frame, f"DISCONNECTED: {time_disconnected:.1f}s. RECONNECTING...", 
+                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            cv2.imshow("GStreamer RTSP Test", frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            
+            # Небольшой сон, если кадр старый, чтобы не грузить CPU в пустом цикле
+            if not adapter.is_frame_fresh:
+                time.sleep(0.1)
+                
     finally:
         adapter.stop()
         cv2.destroyAllWindows()

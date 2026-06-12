@@ -2,9 +2,11 @@ from abc import ABC, abstractmethod
 from collections import deque
 import logging
 import threading
+import time
 from typing import Optional
 import gi
 import numpy as np
+import cv2
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
@@ -43,8 +45,31 @@ class GStreamerAdapter(ABC):
         self.loop_thread = None
         self.converter = None
         self.appsink = None
-                
+
+        self.latest_frame = None
+        self.last_frame_time = 0.0
+        self.lock = threading.Lock()
+
+        self.soft_timeout = 1.0
+        self.hard_timeout = 2.0
+
+        self.stub_frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        cv2.putText(self.stub_frame, "NO SIGNAL / CONNECTING...", (50, self.height // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+
+
         self.logger = logging.getLogger(self.__class__.__name__)
+
+    @property
+    def is_frame_fresh(self) -> bool:
+        """
+        Флаг-свойство: True, если кадр свежий и поток живой.
+        False, если кадры задерживаются дольше, чем soft_timeout.
+        """
+        with self.lock:
+            if self.latest_frame is None:
+                return False
+            return (time.time() - self.last_frame_time) <= self.soft_timeout
 
 
     @abstractmethod
@@ -65,7 +90,7 @@ class GStreamerAdapter(ABC):
         self.appsink.set_property("emit-signals", True)
         self.appsink.set_property("sync", False)
         self.appsink.set_property("drop", True)
-        self.appsink.set_property("max-buffers", 2)
+        self.appsink.set_property("max-buffers", 1)
         
         caps = Gst.Caps.from_string("video/x-raw, format=BGR")
         self.appsink.set_property("caps", caps)
@@ -99,13 +124,20 @@ class GStreamerAdapter(ABC):
 
         buffer.unmap(map_info)
         
-        self.frame_buffer.append(numpy_frame)
+        with self.lock:
+            self.latest_frame = numpy_frame
+            self.last_frame_time = time.time()
 
         return Gst.FlowReturn.OK
 
 
     def start(self):
         """Запуск пайплайна"""
+        with self.lock:
+            self.latest_frame = None
+            self.last_frame_time = 0.0
+
+
         if self.pipeline is None:
             self.initialize_pipeline()
 
@@ -120,6 +152,29 @@ class GStreamerAdapter(ABC):
         self.loop_thread.daemon = True
         self.loop_thread.start()
         self.logger.info("Пайплайн запущен")
+
+
+    def restart(self):
+        """Полный перезапуск пайплайна"""
+
+        self.logger.warning("!!! Инициирован перезапуск паплайна GStreamer !!!")
+
+        if self.loop:
+            self.loop.quit()
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+        if self.loop_thread:
+            self.loop_thread.join(timeout=1)
+
+        self.pipeline = None
+        self.src = None
+        self.depay = None
+        self.parser = None
+        self.decoder_element = None
+        self.converter = None
+        self.appsink = None
+
+        self.start()
 
 
     def stop(self):
@@ -137,10 +192,18 @@ class GStreamerAdapter(ABC):
 
 
     def get_image(self):
-        """Получение изображения из буфера (FIFO)"""
-        if len(self.frame_buffer) > 0:
-            return self.frame_buffer.popleft()
-        return None
+        with self.lock:
+            if self.latest_frame is None:
+                return self.stub_frame
+            
+            time_passed = time.time() - self.last_frame_time
+
+            if time_passed > self.soft_timeout:
+                if int(time_passed) % 2 == 0:
+                    self.logger.warning(f"Поток отвалился! Задержка: {time_passed:.2f} сек. Выводим заглушку")
+                return self.stub_frame
+            
+            return self.latest_frame
 
 
     def _on_bus_message(self, bus, message):
