@@ -6,320 +6,322 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
-from gs_client_base import GStreamerClient
+from gs_client_base import ElementSpec, GStreamerClient
 
 Gst.init(None)
 
+
+CODEC_CHAIN = {
+    "H264": {
+        "depay": "rtph264depay",
+        "parser": "h264parse",
+        "decoder_cuda": "nvh264dec",
+        "decoder_cpu": "avdec_h264",
+    },
+    "H265": {
+        "depay": "rtph265depay",
+        "parser": "h265parse",
+        "decoder_cuda": "nvh265dec",
+        "decoder_cpu": "avdec_h265",
+    },
+}
+
+
 class RTSPClient(GStreamerClient):
-    """
-    Адаптер GStreamer, принимающий RTSP поток
-    """
+    """GStreamer-клиент для RTSP-потока."""
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.src = None
         self.depay = None
         self.parser = None
         self.decoder_element = None
-        
-        self.initialize_pipeline()
 
+        if not self.initialize_pipeline():
+            raise RuntimeError("Не удалось собрать RTSP-пайплайн")
 
-    def initialize_pipeline(self):
-        self.pipeline = Gst.Pipeline.new('rtsp-pipeline')
-        
-        self._create_converter()
-        self._build_appsink()
+    # ------------------------------------------------------------------ #
+    #  Сборка пайплайна                                                  #
+    # ------------------------------------------------------------------ #
 
-        if self.converter and self.appsink:
-            self.logger.info("Связываем статические элементы: converter -> appsink")
-            if not self.converter.link(self.appsink):
-                self.logger.error("Не удалось связать converter с appsink!")
-        
-        self._build_source()
+    def initialize_pipeline(self) -> bool:
+        self.pipeline = Gst.Pipeline.new("rtsp-pipeline")
 
+        if self.decoder == "cuda":
+            if not self._build_gpu_converter():
+                self.logger.warning("GPU-конвертер недоступен, откат на CPU")
+                if not self._build_cpu_converter():
+                    return False
+        else:
+            if not self._build_cpu_converter():
+                return False
 
-    def _build_source(self):
-        """Создание и настройка элемента источника"""
-        self.src = Gst.ElementFactory.make("rtspsrc", "source")
+        if not self._build_appsink():
+            return False
+
+        if not self._link_chain(self.converter_out, self.appsink):
+            return False
+
+        return self._build_rtspsrc()
+
+    def _build_cpu_converter(self) -> bool:
+        src, out = self._build_static_chain([
+            ElementSpec("resize", "videoscale", "cpu-resize", {"method": 0}),
+            ElementSpec("color", "videoconvert", "cpu-color"),
+            ElementSpec(
+                "caps",
+                "capsfilter",
+                "cpu-caps",
+                {"caps": self._output_caps()},
+            ),
+        ])
+        if not src:
+            return False
+
+        self.converter_src = src
+        self.converter_out = out
+        self.logger.info(
+            f"CPU-цепочка: resize -> color -> caps ({self.width}x{self.height} BGR)"
+        )
+        return True
+
+    def _build_gpu_converter(self) -> bool:
+        src, out = self._build_static_chain([
+            ElementSpec("resize", "nvconv", "gpu-resize"),
+            ElementSpec(
+                "caps",
+                "capsfilter",
+                "gpu-caps",
+                {
+                    "caps": Gst.Caps.from_string(
+                        f"video/x-raw, width={self.width}, height={self.height}"
+                    )
+                },
+            ),
+            ElementSpec("color", "videoconvert", "gpu-color"),
+        ])
+        if not src:
+            return False
+
+        self.converter_src = src
+        self.converter_out = out
+        self.logger.info(
+            f"GPU-цепочка: nvconv -> caps -> videoconvert ({self.width}x{self.height})"
+        )
+        return True
+
+    def _build_rtspsrc(self) -> bool:
+        self.src = self._make_element(
+            "rtspsrc",
+            "rtspsrc",
+            "source",
+            defaults={"location": self.source_path},
+        )
         if not self.src:
-            self.logger.error("Не удалось создать элемент rtspsrc")
-            return
-
-        self.src.set_property("location", self.source_path)
+            return False
 
         if self.user:
             self.src.set_property("user-id", self.user)
-
         if self.password:
             self.src.set_property("user-pw", self.password)
-        
-        if self.extra_props:
-            for k, v in self.extra_props.items():
-                if k.startswith("rtspsrc_"):
-                    self.src.set_property(k[8:], v)
-        
+
         self.pipeline.add(self.src)
         self.src.connect("pad-added", self._on_rtspsrc_pad_added, None)
-        self.logger.info("Элемент rtspsrc добавлен и сконфигурирован")
+        self.logger.info("rtspsrc добавлен и сконфигурирован")
+        return True
 
+    # ------------------------------------------------------------------ #
+    #  Динамическая часть: pad-added                                     #
+    # ------------------------------------------------------------------ #
 
-    def _on_rtspsrc_pad_added(self, src_element, new_pad, user_data):
-        self.logger.info(f"Появился новый динамический пад: {new_pad.get_name()}")
+    def _on_rtspsrc_pad_added(self, src_element, new_pad, user_data) -> None:
+        self.logger.info(f"Появился динамический пад: {new_pad.get_name()}")
 
         if not self._is_video_pad(new_pad):
             return
-        
+
         encoding = self._get_encoding_from_pad(new_pad)
         if not encoding:
-            self.logger.warning("Не удалось определить кодек")
             return
-        
-        if not self._create_decoding_chain(encoding):
-            self.logger.warning("Не удалось создать цепочку декодирования")
-            return
-        
-        if not self._link_decoding_chain(new_pad):
-            self.logger.warning("Не удалось связать элементы в цепочке декодирования")
-            return
-        
-        self.logger.info(f"Динамическая RTSP цепочка успешно готова и запущена: {encoding}")
 
+        if not self._create_decoding_chain(encoding):
+            return
+
+        if not self._link_decoding_chain(new_pad):
+            return
+
+        self.logger.info(f"Динамическая цепочка готова: {encoding}")
 
     def _is_video_pad(self, pad) -> bool:
-        """Проверяет, является ли пад видеопотоком"""
         caps = pad.query_caps(None)
         if not caps or caps.is_empty():
             self.logger.error("Не удалось получить caps с пада")
             return False
-        
-        caps_struct = caps.get_structure(0)
-        media_type = caps_struct.get_string("media")
-        
+
+        media_type = caps.get_structure(0).get_string("media")
         if media_type != "video":
             self.logger.info(f"Пропускаем не-видео пад: {media_type}")
             return False
-        
         return True
 
-
     def _get_encoding_from_pad(self, pad) -> Optional[str]:
-        """Определяет кодек с пада"""
-        caps = pad.query_caps(None)
-        caps_struct = caps.get_structure(0)
-        encoding = caps_struct.get_string("encoding-name")
-        
-        if encoding not in ["H264", "H265"]:
+        encoding = pad.query_caps(None).get_structure(0).get_string("encoding-name")
+
+        if encoding not in CODEC_CHAIN:
             self.logger.error(f"Неподдерживаемый кодек: {encoding}")
             return None
-        
+
         self.logger.info(f"Детектирован кодек: {encoding}")
         return encoding
 
-
     def _create_decoding_chain(self, encoding: str) -> bool:
-        """
-        Динамически создает элементы для декодирования и выставляет им 
-        актуальное состояние родительского пайплайна
-        """
-        if not self._create_depay_and_parser(encoding):
+        chain = CODEC_CHAIN[encoding]
+
+        self.depay = self._make_element(
+            "depay",
+            chain["depay"],
+            f"{encoding.lower()}-depay",
+        )
+        self.parser = self._make_element(
+            "parser",
+            chain["parser"],
+            f"{encoding.lower()}-parser",
+        )
+
+        fallbacks = [chain["decoder_cpu"]] if self.decoder == "cuda" else None
+        preferred = (
+            chain["decoder_cuda"] if self.decoder == "cuda" else chain["decoder_cpu"]
+        )
+        self.decoder_element = self._make_element(
+            "decoder",
+            preferred,
+            "decoder",
+            fallbacks=fallbacks,
+        )
+
+        if not all([self.depay, self.parser, self.decoder_element]):
             return False
-        
-        if not self._create_decoder(encoding):
-            return False
-        
-        for elem in [self.depay, self.parser, self.decoder_element]:
-            self.pipeline.add(elem)
-            elem.sync_state_with_parent()
-        
+
+        self._add_to_pipeline(self.depay, self.parser, self.decoder_element, sync=True)
         return True
-
-
-    def _create_depay_and_parser(self, encoding: str) -> bool:
-        """Создает depay и parser элементы"""
-        if encoding == "H264":
-            depay_name = "rtph264depay"
-            parser_name = "h264parse"
-        elif encoding == "H265":
-            depay_name = "rtph265depay"
-            parser_name = "h265parse"
-        else:
-            return False
-        
-        self.depay = Gst.ElementFactory.make(depay_name, f"{encoding.lower()}-depay")
-        self.parser = Gst.ElementFactory.make(parser_name, f"{encoding.lower()}-parser")
-        
-        if not self.depay or not self.parser:
-            self.logger.error(f"Не удалось создать {depay_name} или {parser_name}")
-            return False
-        
-        if self.extra_props:
-            for k, v in self.extra_props.items():
-                if k.startswith("depay_"):
-                    self.depay.set_property(k[6:], v)
-
-        if self.extra_props:
-            for k, v in self.extra_props.items():
-                if k.startswith("parser_"):
-                    self.parser.set_property(k[7:], v)
-        
-        return True
-
-
-    def _create_decoder(self, encoding: str) -> bool:
-        """Создает декодер (CUDA или CPU)"""
-        if encoding == "H264":
-            decoder_cuda = "nvh264dec"
-            decoder_cpu = "avdec_h264"
-        else:
-            decoder_cuda = "nvh265dec"
-            decoder_cpu = "avdec_h265"
-        
-        if self.decoder == "cuda":
-            decoder_name = decoder_cuda
-            self.decoder_element = Gst.ElementFactory.make(decoder_name, "decoder")
-            
-            if not self.decoder_element:
-                self.logger.warning(f"Не удалось создать CUDA декодер {decoder_name}, откатываемся на CPU")
-                decoder_name = decoder_cpu
-                self.decoder_element = Gst.ElementFactory.make(decoder_name, "decoder")
-        else:
-            decoder_name = decoder_cpu
-            self.decoder_element = Gst.ElementFactory.make(decoder_name, "decoder")
-        
-        if not self.decoder_element:
-            self.logger.error(f"Не удалось создать декодер: {decoder_name}")
-            return False
-        
-        if self.extra_props:
-            for k, v in self.extra_props.items():
-                if k.startswith("decoder_"):
-                    self.decoder_element.set_property(k[8:], v)
-
-        self.logger.info(f"Создан декодер: {decoder_name}")
-        return True
-
 
     def _link_decoding_chain(self, new_pad) -> bool:
-        """
-        Связывает динамическую цепочку:
-        new_pad (rtspsrc) -> depay -> parser -> decoder -> converter
-        """
         if not self._link_pad_to_depay(new_pad):
             return False
-        
-        if not self.depay.link(self.parser):
-            self.logger.error("Не удалось связать depay -> parser")
-            return False
-        
-        if not self.parser.link(self.decoder_element):
-            self.logger.error("Не удалось связать parser -> decoder")
-            return False
-        
-        if self.converter and not self.decoder_element.link(self.converter):
-            self.logger.error("Не удалось связать decoder -> converter")
-            return False
-        
-        self.logger.info("Все динамические элементы успешно связаны с конвертером")
-        return True
 
+        if not self._link_chain(self.depay, self.parser, self.decoder_element):
+            return False
+
+        if not self.converter_src:
+            self.logger.error("converter_src не задан")
+            return False
+
+        if not self._link(
+            self.decoder_element,
+            self.converter_src,
+            "decoder -> converter_src",
+        ):
+            return False
+
+        self.logger.info("Динамическая цепочка связана с конвертером")
+        return True
 
     def _link_pad_to_depay(self, new_pad) -> bool:
-        """Связывает динамический пад rtspsrc с депайлоудером"""
         sink_pad = self.depay.get_static_pad("sink")
-        
         if not sink_pad:
-            self.logger.error("У depay нет sink пада")
+            self.logger.error("У depay нет sink-пада")
             return False
-        
+
         if sink_pad.is_linked():
-            self.logger.warning("Sink пад depay уже с чем-то связан")
+            self.logger.warning("Sink-пад depay уже связан")
             return False
-        
+
         ret = new_pad.link(sink_pad)
         if ret != Gst.PadLinkReturn.OK:
-            self.logger.error(f"Не удалось связать rtspsrc пад с depay: {ret}")
+            self.logger.error(f"Не удалось связать rtspsrc -> depay: {ret}")
             return False
-        
+
         return True
 
-
-    def _create_converter(self):
-        """Создает видео-конвертер и сразу добавляет его в пайплайн"""
-        if self.decoder == "cuda":
-            converter = Gst.ElementFactory.make("nvconv", "gpu-converter")
-            if not converter:
-                self.logger.warning("Не удалось создать nvconv, переключаюсь на videoconvert")
-                converter = Gst.ElementFactory.make("videoconvert", "cpu-converter")
-        else:
-            converter = Gst.ElementFactory.make("videoconvert", "cpu-converter")
-        
-        if not converter:
-            self.logger.error("Не удалось создать элемент конвертера")
-            return
-        
-        self.pipeline.add(converter)
-        self.converter = converter
+    def restart(self) -> bool:
+        self.src = None
+        self.depay = None
+        self.parser = None
+        self.decoder_element = None
+        return super().restart()
 
 
 if __name__ == "__main__":
     import cv2
-    
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
     adapter = RTSPClient(
-        source_path="rtsp://example", 
-        width=720, 
-        height=480, 
-        fps=30, 
+        source_path="rtsp://172.16.1.10:8554/19",
+        width=1440,
+        height=1280,
+        fps=30,
         decoder="cpu",
-        extra_props={"rtspsrc_protocols": 4,
-                     "rtspsrc_latency": 0,
-                     "rtspsrc_drop-on-latency": True,
-                     "rtspsrc_buffer-mode": 0,
-                     "depay_request-keyframe": True,
-                     }
+        element_props={
+            "rtspsrc": {
+                "protocols": 4,
+                "latency": 0,
+                "drop-on-latency": True,
+                "buffer-mode": 0,
+            },
+            "depay": {
+                "request-keyframe": True,
+            },
+        },
     )
 
     adapter.start()
 
     disconnect_start_time = None
-    reconnect_cooldown = 5.0  # Пытаться переподключаться каждые 5 секунд
+    reconnect_cooldown = 5.0
 
     try:
         while True:
             frame = adapter.get_image()
 
             if adapter.is_frame_fresh:
-                # Поток живой — сбрасываем таймер отвала
                 disconnect_start_time = None
-                
-                # логика обработки кадра
-                cv2.putText(frame, "ONLINE", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(
+                    frame, "ONLINE", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+                )
             else:
-                # Кадр "протух" (нет связи больше 1 секунды)
                 if disconnect_start_time is None:
                     disconnect_start_time = time.time()
-                
+
                 time_disconnected = time.time() - disconnect_start_time
-                
-                # Если связь отсутствует дольше лимита (5 секунд) — делаем рестарт
+
                 if time_disconnected > reconnect_cooldown:
-                    print("Связь потеряна окончательно. Переподключаемся...")
+                    print("Связь потеряна. Переподключаемся...")
                     adapter.restart()
-                    disconnect_start_time = time.time() # Сбрасываем таймер, чтобы дать пайплайну время завестись
-                
-                cv2.putText(frame, f"DISCONNECTED: {time_disconnected:.1f}s. RECONNECTING...", 
-                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    disconnect_start_time = time.time()
+
+                cv2.putText(
+                    frame,
+                    f"DISCONNECTED: {time_disconnected:.1f}s. RECONNECTING...",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),
+                    2,
+                )
 
             cv2.imshow("GStreamer RTSP Test", frame)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-            
-            # Небольшой сон, если кадр старый, чтобы не грузить CPU в пустом цикле
+
             if not adapter.is_frame_fresh:
                 time.sleep(0.1)
-                
+
     finally:
         adapter.stop()
         cv2.destroyAllWindows()
