@@ -5,9 +5,11 @@ import logging
 import threading
 import time
 from typing import Any, Optional
-import gi
 import numpy as np
 import cv2
+
+import gi
+
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
@@ -65,8 +67,13 @@ class GStreamerClient(ABC):
         self.last_frame_time = 0.0
         self.lock = threading.Lock()
 
-        self.soft_timeout = 1.0
-        self.hard_timeout = 2.0
+        if self.fps and self.fps > 0:
+            frame_interval = 1.0 / self.fps
+            self.soft_timeout = max(1.0, frame_interval * 3)
+            self.hard_timeout = self.soft_timeout * 2
+        else:
+            self.soft_timeout = 1.0
+            self.hard_timeout = 2.0
 
         self.stub_frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         cv2.putText(
@@ -82,9 +89,6 @@ class GStreamerClient(ABC):
 
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    # ------------------------------------------------------------------ #
-    #  Движок сборки пайплайна                                           #
-    # ------------------------------------------------------------------ #
 
     def _make_element(
         self,
@@ -121,11 +125,13 @@ class GStreamerClient(ABC):
         self.logger.info(f"[{slot}] Создан {factory} ({name})")
         return elem
 
+
     def _link(self, src: Gst.Element, dst: Gst.Element, label: str) -> bool:
         if not src.link(dst):
             self.logger.error(f"Не удалось связать {label}")
             return False
         return True
+
 
     def _link_chain(self, *elements: Gst.Element) -> bool:
         for src, dst in zip(elements, elements[1:]):
@@ -134,11 +140,13 @@ class GStreamerClient(ABC):
                 return False
         return True
 
+
     def _add_to_pipeline(self, *elements: Gst.Element, sync: bool = False) -> None:
         for elem in elements:
             self.pipeline.add(elem)
             if sync:
                 elem.sync_state_with_parent()
+
 
     def _build_static_chain(
         self, specs: list[ElementSpec]
@@ -164,10 +172,13 @@ class GStreamerClient(ABC):
 
         return elements[0], elements[-1]
 
+
     def _output_caps(self) -> Gst.Caps:
-        return Gst.Caps.from_string(
-            f"video/x-raw, format=BGR, width={self.width}, height={self.height}"
-        )
+        caps = f"video/x-raw, format=BGR, width={self.width}, height={self.height}"
+        if self.fps and self.fps > 0:
+            caps += f", framerate={self.fps}/1"
+        return Gst.Caps.from_string(caps)
+
 
     def _build_appsink(self) -> bool:
         self.appsink = self._make_element(
@@ -192,9 +203,6 @@ class GStreamerClient(ABC):
         )
         return True
 
-    # ------------------------------------------------------------------ #
-    #  Runtime                                                           #
-    # ------------------------------------------------------------------ #
 
     @property
     def is_frame_fresh(self) -> bool:
@@ -203,10 +211,12 @@ class GStreamerClient(ABC):
                 return False
             return (time.time() - self.last_frame_time) <= self.soft_timeout
 
+
     @abstractmethod
     def initialize_pipeline(self) -> bool:
         """Сборка пайплайна. Возвращает True при успехе."""
         ...
+
 
     def _on_new_sample(self, appsink: Gst.Element) -> Gst.FlowReturn:
         sample = appsink.pull_sample()
@@ -236,6 +246,7 @@ class GStreamerClient(ABC):
 
         return Gst.FlowReturn.OK
 
+
     def start(self) -> bool:
         with self.lock:
             self.latest_frame = None
@@ -258,6 +269,7 @@ class GStreamerClient(ABC):
         self.logger.info("Пайплайн запущен")
         return True
 
+
     def restart(self) -> bool:
         self.logger.warning("!!! Инициирован перезапуск пайплайна GStreamer !!!")
 
@@ -275,6 +287,7 @@ class GStreamerClient(ABC):
 
         return self.start()
 
+
     def stop(self) -> None:
         self.logger.info("Остановка пайплайна...")
         if self.loop:
@@ -284,6 +297,7 @@ class GStreamerClient(ABC):
         if self.loop_thread:
             self.loop_thread.join(timeout=2)
         self.logger.info("Пайплайн остановлен")
+
 
     def get_image(self):
         with self.lock:
@@ -299,6 +313,7 @@ class GStreamerClient(ABC):
                 return self.stub_frame
 
             return self.latest_frame
+
 
     def _on_bus_message(self, bus, message) -> None:
         msg_type = message.type

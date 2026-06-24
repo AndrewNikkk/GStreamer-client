@@ -1,6 +1,7 @@
 import logging
 import time
 from typing import Optional
+
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -40,9 +41,6 @@ class RTSPClient(GStreamerClient):
         if not self.initialize_pipeline():
             raise RuntimeError("Не удалось собрать RTSP-пайплайн")
 
-    # ------------------------------------------------------------------ #
-    #  Сборка пайплайна                                                  #
-    # ------------------------------------------------------------------ #
 
     def initialize_pipeline(self) -> bool:
         self.pipeline = Gst.Pipeline.new("rtsp-pipeline")
@@ -64,29 +62,40 @@ class RTSPClient(GStreamerClient):
 
         return self._build_rtspsrc()
 
+
     def _build_cpu_converter(self) -> bool:
-        src, out = self._build_static_chain([
+        specs = [
             ElementSpec("resize", "videoscale", "cpu-resize", {"method": 0}),
             ElementSpec("color", "videoconvert", "cpu-color"),
-            ElementSpec(
-                "caps",
-                "capsfilter",
-                "cpu-caps",
-                {"caps": self._output_caps()},
-            ),
-        ])
+        ]
+
+        if self.fps and self.fps > 0:
+            specs.append(
+                ElementSpec("rate", "videorate", "cpu-rate", {"drop-only": True})
+            )
+
+        specs.append(
+            ElementSpec("caps", "capsfilter", "cpu-caps", {"caps": self._output_caps()})
+        )
+
+        src, out = self._build_static_chain(specs)
+
         if not src:
             return False
-
+        
         self.converter_src = src
         self.converter_out = out
+
         self.logger.info(
-            f"CPU-цепочка: resize -> color -> caps ({self.width}x{self.height} BGR)"
+            f"CPU-цепочка собрана: {self.width}x{self.height} BGR"
+            + (f", {self.fps} fps" if self.fps and self.fps > 0 else "")
         )
+
         return True
 
+
     def _build_gpu_converter(self) -> bool:
-        src, out = self._build_static_chain([
+        specs = [
             ElementSpec("resize", "nvconv", "gpu-resize"),
             ElementSpec(
                 "caps",
@@ -99,16 +108,32 @@ class RTSPClient(GStreamerClient):
                 },
             ),
             ElementSpec("color", "videoconvert", "gpu-color"),
-        ])
+        ]
+
+        if self.fps and self.fps > 0:
+            specs.append(
+                ElementSpec("rate", "videorate", "gpu-rate", {"drop-only": True})
+            )
+
+        specs.append(
+            ElementSpec("caps", "capsfilter", "gpu-out-caps", {"caps": self._output_caps()})
+        )
+
+        src, out = self._build_static_chain(specs)
+
         if not src:
             return False
-
+        
         self.converter_src = src
         self.converter_out = out
+
         self.logger.info(
-            f"GPU-цепочка: nvconv -> caps -> videoconvert ({self.width}x{self.height})"
+            f"GPU-цепочка собрана: {self.width}x{self.height} BGR"
+            + (f", {self.fps} fps" if self.fps and self.fps > 0 else "")
         )
+
         return True
+
 
     def _build_rtspsrc(self) -> bool:
         self.src = self._make_element(
@@ -130,9 +155,6 @@ class RTSPClient(GStreamerClient):
         self.logger.info("rtspsrc добавлен и сконфигурирован")
         return True
 
-    # ------------------------------------------------------------------ #
-    #  Динамическая часть: pad-added                                     #
-    # ------------------------------------------------------------------ #
 
     def _on_rtspsrc_pad_added(self, src_element, new_pad, user_data) -> None:
         self.logger.info(f"Появился динамический пад: {new_pad.get_name()}")
@@ -152,6 +174,7 @@ class RTSPClient(GStreamerClient):
 
         self.logger.info(f"Динамическая цепочка готова: {encoding}")
 
+
     def _is_video_pad(self, pad) -> bool:
         caps = pad.query_caps(None)
         if not caps or caps.is_empty():
@@ -163,6 +186,7 @@ class RTSPClient(GStreamerClient):
             self.logger.info(f"Пропускаем не-видео пад: {media_type}")
             return False
         return True
+
 
     def _get_encoding_from_pad(self, pad) -> Optional[str]:
         encoding = pad.query_caps(None).get_structure(0).get_string("encoding-name")
@@ -205,6 +229,7 @@ class RTSPClient(GStreamerClient):
         self._add_to_pipeline(self.depay, self.parser, self.decoder_element, sync=True)
         return True
 
+
     def _link_decoding_chain(self, new_pad) -> bool:
         if not self._link_pad_to_depay(new_pad):
             return False
@@ -226,6 +251,7 @@ class RTSPClient(GStreamerClient):
         self.logger.info("Динамическая цепочка связана с конвертером")
         return True
 
+
     def _link_pad_to_depay(self, new_pad) -> bool:
         sink_pad = self.depay.get_static_pad("sink")
         if not sink_pad:
@@ -242,6 +268,7 @@ class RTSPClient(GStreamerClient):
             return False
 
         return True
+
 
     def restart(self) -> bool:
         self.src = None
@@ -260,10 +287,10 @@ if __name__ == "__main__":
     )
 
     adapter = RTSPClient(
-        source_path="rtsp://172.16.1.10:8554/19",
+        source_path="rtsp://example",
         width=1440,
         height=1280,
-        fps=30,
+        fps=1,
         decoder="cpu",
         element_props={
             "rtspsrc": {
